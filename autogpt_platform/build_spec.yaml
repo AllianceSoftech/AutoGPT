@@ -1,0 +1,207 @@
+version: 0.1
+component: build
+timeoutInSeconds: 3600
+runAs: root
+steps:
+  # Build backend Docker image
+  - type: Build
+    name: Build Backend Image
+    buildSpecPath: ""
+    image: OL8_X86_64_STANDARD_10
+    buildSpec:
+      steps:
+        - type: Build
+          name: Build Image
+          command: |
+            docker build -t ${OCI_REGISTRY}/${OCI_REPO_PATH}/backend:${BUILD_NUMBER} \
+              -f autogpt_platform/backend/Dockerfile \
+              --target server ../
+          timeoutInSeconds: 1800
+
+  # Push Docker images to OCIR
+  - type: DeliverArtifacts
+    name: Push to OCIR
+    artifactType: DOCKER_IMAGE
+    artifactPaths:
+      - "${OCI_REGISTRY}/${OCI_REPO_PATH}/backend:${BUILD_NUMBER}"
+
+  # Generate Kubernetes manifest
+  - type: Build
+    name: Generate Deployment Manifest
+    image: OL8_X86_64_STANDARD_10
+    command: |
+      cat > autogpt-deploy.yaml << EOF
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: autogpt
+      ---
+      # Redis Deployment
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: redis
+        namespace: autogpt
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: redis
+        template:
+          metadata:
+            labels:
+              app: redis
+          spec:
+            containers:
+              - name: redis
+                image: redis:latest
+                command: ["redis-server", "--requirepass", "\${REDIS_PASSWORD}"]
+                ports:
+                  - containerPort: 6379
+                envFrom:
+                  - configMapRef:
+                      name: autogpt
+                readinessProbe:
+                  exec:
+                    command: ["redis-cli", "ping"]
+                  initialDelaySeconds: 5
+                  periodSeconds: 10
+      ---
+      # RabbitMQ Deployment
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: rabbitmq
+        namespace: autogpt
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: rabbitmq
+        template:
+          metadata:
+            labels:
+              app: rabbitmq
+          spec:
+            containers:
+              - name: rabbitmq
+                image: rabbitmq:management
+                envFrom:
+                  - configMapRef:
+                      name: autogpt
+                ports:
+                  - containerPort: 5672
+                  - containerPort: 15672
+                readinessProbe:
+                  exec:
+                    command: ["rabbitmq-diagnostics", "ping"]
+                  initialDelaySeconds: 10
+                  periodSeconds: 30
+      ---
+      # Backend Services (rest_server, executor, websocket_server, scheduler_server)
+      # Generic template for backend services
+      # Repeat for each service with appropriate changes
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: rest-server
+        namespace: autogpt
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: rest-server
+        template:
+          metadata:
+            labels:
+              app: rest-server
+          spec:
+            initContainers:
+              - name: wait-for-db
+                image: busybox
+                command: ['sh', '-c', 'until nc -z db 5432; do echo "Waiting for DB"; sleep 2; done']
+              - name: migration
+                image: ${OCI_REGISTRY}/${OCI_REPO_PATH}/backend:${BUILD_NUMBER}
+                command: ["sh", "-c", "poetry run prisma migrate deploy"]
+                envFrom:
+                  - configMapRef:
+                      name: autogpt
+            containers:
+              - name: rest-server
+                image: ${OCI_REGISTRY}/${OCI_REPO_PATH}/backend:${BUILD_NUMBER}
+                command: ["python", "-m", "backend.rest"]
+                envFrom:
+                  - configMapRef:
+                      name: autogpt
+                ports:
+                  - containerPort: 8006
+                  - containerPort: 8007
+                readinessProbe:
+                  exec:
+                    command: ["curl", "-f", "http://localhost:8006/health"]
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+            restartPolicy: Always
+      ---
+      # ClamAV Deployment
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: clamav
+        namespace: autogpt
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: clamav
+        template:
+          metadata:
+            labels:
+              app: clamav
+          spec:
+            containers:
+              - name: clamav
+                image: clamav/clamav-debian:latest
+                ports:
+                  - containerPort: 3310
+                volumeMounts:
+                  - name: clamav-data
+                    mountPath: /var/lib/clamav
+                env:
+                  - name: CLAMD_CONF_StreamMaxLength
+                    value: "50M"
+                  - name: CLAMD_CONF_MaxFileSize
+                    value: "100M"
+            volumes:
+              - name: clamav-data
+                persistentVolumeClaim:
+                  claimName: clamav-pvc
+      ---
+      # Services for each component
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: redis
+        namespace: autogpt
+      spec:
+        selector:
+          app: redis
+        ports:
+          - protocol: TCP
+            port: 6379
+            targetPort: 6379
+      ---
+      # Repeat service definitions for each component
+      # (rabbitmq, rest-server, executor, websocket-server, scheduler-server, clamav)
+      EOF
+
+      # Insert other service definitions similarly
+      echo "Manifest created"
+
+  # Push manifest to OCI Artifact Repository
+  - type: DeliverArtifacts
+    name: Push Manifest
+    artifactType: GENERIC_ARTIFACT
+    artifactPaths:
+      - autogpt-deploy.yaml
+    artifactRepository: autogpt-deploy
